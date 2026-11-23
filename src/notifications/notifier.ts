@@ -13,6 +13,7 @@
  *   - {@link routeStatus}      — actionable status when zero routes are active
  */
 
+import { createHash } from "node:crypto";
 import type { Bot } from "grammy";
 
 import { applyChatMigration, type BotConfig } from "../config.js";
@@ -24,12 +25,27 @@ import {
   type ExplorerKeyboard,
 } from "./format.js";
 import { DEFAULT_SILENT_EVENTS, isSilent } from "./priority.js";
+import type { SendJournal } from "./send-journal.js";
 
 // Re-export isTimeoutError so callers that only import from notifier.ts
 // can classify timeout errors without also depending on format.ts directly.
 export { isTimeoutError } from "./format.js";
 
 // ── SendExtra ────────────────────────────────────────────────────────────────
+
+/** A Telegram destination: a chat id plus an optional forum topic (thread) id. */
+export interface NotificationDestination {
+  chatId: string;
+  topicId?: number | undefined;
+}
+
+/** Optional dependencies for {@link createNotifier}. */
+export interface NotifierOptions {
+  /** Optional send journal for persisting per-destination delivery outcomes. */
+  sendJournal?: SendJournal | undefined;
+  /** Clock override for journal timestamps (defaults to `Date.now`). */
+  now?: (() => number) | undefined;
+}
 
 /** Extra Telegram send options the poller may attach to a notification. */
 export interface SendExtra {
@@ -340,6 +356,7 @@ export function createNotifier(
       for (const [index, part] of parts.entries()) {
         await bot.api.sendMessage(chatId, part, {
           ...notificationOptions,
+          ...threadOption,
           ...(index === parts.length - 1 && extra?.reply_markup
             ? { reply_markup: extra.reply_markup }
             : {}),
@@ -354,6 +371,7 @@ export function createNotifier(
     try {
       await bot.api.sendMessage(chatId, text, {
         ...notificationOptions,
+        ...threadOption,
         ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
         ...(replyToMessageId !== undefined
           ? { reply_parameters: { chat_id: chatId, message_id: replyToMessageId } }
@@ -389,6 +407,7 @@ export function createNotifier(
       await bot.api.sendMessage(chatId, fallback, {
         link_preview_options: notificationOptions.link_preview_options,
         ...silentOption,
+        ...threadOption,
         ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
         ...(replyToMessageId !== undefined
           ? { reply_parameters: { chat_id: chatId, message_id: replyToMessageId } }

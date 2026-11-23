@@ -29,8 +29,17 @@
 import { mkdir, open, readFile, rename } from "node:fs/promises";
 import path from "node:path";
 
+import { sanitizeTelegramError } from "./notifier.js";
+
 export const DEFAULT_SEND_JOURNAL_MAX_ENTRIES = 1_000;
 export const DEFAULT_SEND_JOURNAL_MAX_BYTES = 1_000_000;
+
+export type DeliveryOutcome = "sent" | "failed" | "skipped";
+
+export interface JournalDestination {
+  chatId: string;
+  topicId?: number | undefined;
+}
 
 export interface JournalEntry {
   kind: "intent" | "done" | "timeout";
@@ -38,8 +47,18 @@ export interface JournalEntry {
   source: string;
   ledger: number;
   eventName: string;
+  /** Target Telegram chat id when tracked per-destination. */
+  chatId?: string;
+  /** Target Telegram forum topic / thread id when tracked per-destination. */
+  topicId?: number;
+  /** Persisted delivery outcome on `done` entries. */
+  outcome?: DeliveryOutcome;
   /** Bounded hash of the message body; the body itself is never persisted. */
   textHash?: string;
+  /** Stable error code for operator triage (e.g. Telegram error_code 400, 429). */
+  errorCode?: number | string;
+  /** Sanitized, redacted, and length-bounded error description. */
+  errorDescription?: string;
   at: number;
   /**
    * Bounded, scrubbed description of the timeout that produced this entry.
@@ -49,11 +68,43 @@ export interface JournalEntry {
   timeoutReason?: string;
 }
 
+export type OrphanReason = "removed_route" | "network_changed";
+
+export interface OrphanedJournalEntry {
+  entry: JournalEntry;
+  reason: OrphanReason;
+  /** Current resolved route chat ID for this entry's source, if any. */
+  currentChatId?: string;
+  /** Current configured network passphrase, if any. */
+  currentNetworkPassphrase?: string;
+}
+
+export interface JournalRecoveryContext {
+  /** Resolve the current route chat ID for a given entry source (empty = removed). */
+  resolveRouteChatId?: (source: string) => string;
+  /** Current Stellar network passphrase. */
+  networkPassphrase?: string;
+}
+
+export type OrphanDecision =
+  | { action: "discard" }
+  | { action: "reroute"; chatId?: string; networkPassphrase?: string };
+
+export interface OrphanRecoveryResult {
+  valid: JournalEntry[];
+  orphaned: OrphanedJournalEntry[];
+  discarded: number;
+  rerouted: number;
+  reroutedEntries: JournalEntry[];
+}
+
 export interface SendJournalOptions {
   filePath: string;
   maxEntries?: number;
   maxBytes?: number;
   now?: () => number;
+  /** Known secrets (e.g. botToken) to redact from persisted error descriptions. */
+  secrets?: readonly string[];
 }
 
 export interface SendJournalStats {
@@ -67,7 +118,11 @@ export interface SendJournal {
     source: string;
     ledger: number;
     eventName: string;
+    chatId?: string;
+    topicId?: number;
     textHash?: string;
+    chatId?: string;
+    networkPassphrase?: string;
     at: number;
   }): Promise<void>;
   recordDone(id: string): Promise<void>;
@@ -90,6 +145,11 @@ export interface SendJournal {
   loadUnknownOutcomes(): Promise<JournalEntry[]>;
   compact(): Promise<void>;
   stats(): Promise<SendJournalStats>;
+}
+
+function entryKey(id: string, chatId?: string, topicId?: number): string {
+  if (chatId === undefined && topicId === undefined) return id;
+  return `${id}\0${chatId ?? ""}\0${topicId !== undefined ? String(topicId) : ""}`;
 }
 
 function line(entry: JournalEntry): string {
@@ -175,14 +235,33 @@ export function createSendJournal(options: SendJournalOptions): SendJournal {
     source: string;
     ledger: number;
     eventName: string;
+    chatId?: string;
+    topicId?: number;
     textHash?: string;
+    chatId?: string;
+    networkPassphrase?: string;
     at: number;
   }): Promise<void> {
     await append({ kind: "intent", ...entry });
   }
 
-  async function recordDone(id: string): Promise<void> {
-    await append({ kind: "done", id, source: "", ledger: 0, eventName: "", at: now() });
+  async function recordDone(
+    id: string,
+    destination?: JournalDestination,
+    outcome?: DeliveryOutcome,
+  ): Promise<void> {
+    const doneEntry: JournalEntry = {
+      kind: "done",
+      id,
+      source: "",
+      ledger: 0,
+      eventName: "",
+      ...(destination ? { chatId: destination.chatId } : {}),
+      ...(destination?.topicId !== undefined ? { topicId: destination.topicId } : {}),
+      ...(outcome !== undefined ? { outcome } : destination ? { outcome: "sent" as const } : {}),
+      at: now(),
+    };
+    await append(doneEntry);
     // Once a send is accounted for, compact resolved pairs away when the file
     // has grown past its budget so the journal stays bounded.
     const stats = await journalStats();
@@ -209,11 +288,11 @@ export function createSendJournal(options: SendJournalOptions): SendJournal {
 
   async function loadPending(): Promise<JournalEntry[]> {
     const entries = await readLines();
-    const done = new Set<string>();
+    const settled = new Set<string>();
     for (const entry of entries) {
-      if (entry.kind === "done") done.add(entry.id);
+      if (entry.kind === "done" || entry.kind === "error") settled.add(entry.id);
     }
-    return entries.filter((e) => e.kind === "intent" && !done.has(e.id));
+    return entries.filter((e) => e.kind === "intent" && !settled.has(e.id));
   }
 
   async function loadUnknownOutcomes(): Promise<JournalEntry[]> {
@@ -233,9 +312,9 @@ export function createSendJournal(options: SendJournalOptions): SendJournal {
 
   async function compact(): Promise<void> {
     const entries = await readLines();
-    const done = new Set<string>();
+    const settled = new Set<string>();
     for (const entry of entries) {
-      if (entry.kind === "done") done.add(entry.id);
+      if (entry.kind === "done" || entry.kind === "error") settled.add(entry.id);
     }
     // A done line settles its intent: both lines (and any associated timeout
     // lines for the same id) can be dropped. Keep only unresolved intents and
